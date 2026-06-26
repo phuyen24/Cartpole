@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
+import sys
+import math
 import gym
 import ptan
 import numpy as np
+import pygame
 from torch.utils.tensorboard.writer import SummaryWriter
 
 import torch
@@ -18,6 +21,28 @@ EPSILON_STEPS = 5000
 
 REPLAY_BUFFER = 50000
 TARGET_SYNC = 1000
+SOLVED_MEAN_REWARD = 475
+RENDER = False
+
+# ── Palette ──────────────────────────────────────────────────────────────────
+BG      = (247, 250, 252)
+CART_C  = ( 27,  43,  91)
+POLE_C  = (255, 127,  80)
+TRACK_C = ( 24,  28,  30)
+PIVOT_C = (235, 238, 240)
+PANEL   = ( 36,  46,  63)
+TXT_DIM = (189, 199, 220)
+TXT_WHT = (255, 255, 255)
+GREEN   = ( 16, 185, 129)
+BORDER  = (197, 198, 208)
+
+W, H     = 900, 560
+TRACK_Y  = H - 100
+CART_W   = 96
+CART_H   = 48
+POLE_LEN = 180
+POLE_W   = 5
+PIVOT_R  = 8
 
 
 class DQN(nn.Module):
@@ -47,7 +72,73 @@ def calc_target(target_net: DQN, local_reward: float, next_state: np.ndarray) ->
     return local_reward + GAMMA * best_q
 
 
+def draw(screen, obs, step, episode, reward, mean_100, epsilon, fonts):
+    f_hdr, f_lbl, f_dat = fonts
+    screen.fill(BG)
+
+    # Track
+    pygame.draw.line(screen, TRACK_C, (0, TRACK_Y),     (W, TRACK_Y),     1)
+    pygame.draw.line(screen, TRACK_C, (0, TRACK_Y + 8), (W, TRACK_Y + 8), 1)
+
+    # Cart
+    scale = (W // 2 - CART_W) / 2.4
+    cx    = int(W // 2 + obs[0] * scale)
+    top_y = TRACK_Y - CART_H
+    pygame.draw.rect(screen, CART_C,
+                     pygame.Rect(cx - CART_W // 2, top_y, CART_W, CART_H),
+                     border_radius=4)
+
+    # Pole
+    piv_x = cx
+    piv_y = top_y + CART_H // 2
+    angle  = obs[2]
+    end_x  = int(piv_x + POLE_LEN * math.sin(angle))
+    end_y  = int(piv_y - POLE_LEN * math.cos(angle))
+    pygame.draw.line(screen, POLE_C, (piv_x, piv_y), (end_x, end_y), POLE_W)
+
+    # Pivot
+    pygame.draw.circle(screen, PIVOT_C, (piv_x, piv_y), PIVOT_R)
+
+    # Stats panel
+    PW, PH, PX, PY = 240, 210, 24, 24
+    surf = pygame.Surface((PW, PH), pygame.SRCALPHA)
+    surf.fill((*PANEL, 210))
+    screen.blit(surf, (PX, PY))
+    pygame.draw.rect(screen, (*BORDER, 50), (PX, PY, PW, PH), 1, border_radius=8)
+
+    y = PY + 14
+    screen.blit(f_hdr.render("SIMULATION STATS", True, TXT_DIM), (PX + 16, y))
+    y += 28
+
+    def row(label, value, color=TXT_WHT):
+        lbl = f_lbl.render(label, True, TXT_DIM)
+        val = f_dat.render(value, True, color)
+        screen.blit(lbl, (PX + 16, y + 2))
+        screen.blit(val, (PX + PW - val.get_width() - 16, y))
+
+    row("Step",    str(step));                 y += 28
+    row("Episode", str(episode));              y += 28
+    row("Epsilon", f"{epsilon:.2f}");          y += 28
+    pygame.draw.line(screen, BORDER,
+                     (PX + 16, y), (PX + PW - 16, y), 1)
+    y += 12
+    row("Reward",   f"{reward:.1f}",  GREEN);  y += 28
+    row("Mean_100", f"{mean_100:.1f}", GREEN)
+
+    pygame.display.flip()
+
+
 if __name__ == "__main__":
+    if RENDER:
+        pygame.init()
+        screen = pygame.display.set_mode((W, H))
+        pygame.display.set_caption("CartPole — DQN Training")
+        clock = pygame.time.Clock()
+        f_hdr = pygame.font.SysFont("Arial", 11, bold=True)
+        f_lbl = pygame.font.SysFont("Arial", 12)
+        f_dat = pygame.font.SysFont("Arial", 18, bold=True)
+        fonts = (f_hdr, f_lbl, f_dat)
+
     env = gym.make("CartPole-v1")
     writer = SummaryWriter(comment="-cartpole-dqn")
 
@@ -67,11 +158,26 @@ if __name__ == "__main__":
     total_rewards = []
     step_idx = 0
     done_episodes = 0
+    last_reward = 0.0
+    mean_rewards = 0.0
 
     while True:
+        if RENDER:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    env.close()
+                    writer.close()
+                    pygame.quit()
+                    sys.exit()
+
         step_idx += 1
         selector.epsilon = max(EPSILON_STOP, EPSILON_START - step_idx / EPSILON_STEPS)
         replay_buffer.populate(1)
+
+        if RENDER and replay_buffer.buffer:
+            draw(screen, replay_buffer.buffer[-1].state, step_idx, done_episodes,
+                 last_reward, mean_rewards, selector.epsilon, fonts)
+            clock.tick(60)
 
         if len(replay_buffer) < BATCH_SIZE:
             continue
@@ -99,18 +205,21 @@ if __name__ == "__main__":
         new_rewards = exp_source.pop_total_rewards()
         if new_rewards:
             done_episodes += 1
-            reward = new_rewards[0]
-            total_rewards.append(reward)
+            last_reward = new_rewards[0]
+            total_rewards.append(last_reward)
             mean_rewards = float(np.mean(total_rewards[-100:]))
             print("%d: reward: %6.2f, mean_100: %6.2f, epsilon: %.2f, episodes: %d" % (
-                step_idx, reward, mean_rewards, selector.epsilon, done_episodes))
-            writer.add_scalar("reward", reward, step_idx)
+                step_idx, last_reward, mean_rewards, selector.epsilon, done_episodes))
+            writer.add_scalar("reward", last_reward, step_idx)
             writer.add_scalar("reward_100", mean_rewards, step_idx)
             writer.add_scalar("epsilon", selector.epsilon, step_idx)
             writer.add_scalar("episodes", done_episodes, step_idx)
-            if mean_rewards > 450:
+            if mean_rewards >= SOLVED_MEAN_REWARD:
                 print("Solved in %d steps and %d episodes!" % (step_idx, done_episodes))
                 torch.save(net.state_dict(), "cartpole-dqn.pth")
                 break
+
     writer.close()
     env.close()
+    if RENDER:
+        pygame.quit()
