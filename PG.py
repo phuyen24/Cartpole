@@ -1,26 +1,45 @@
 #!/usr/bin/env python3
-import sys
+import argparse
+import csv
 import math
-import gym
-import ptan
-import numpy as np
+import os
+import random
+import sys
+import time
 import typing as tt
-import pygame
-from tensorboardX import SummaryWriter
 
+import gym
+import numpy as np
+import ptan
+import pygame
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from tensorboardX import SummaryWriter
 
-GAMMA = 0.99
-LEARNING_RATE = 0.001
-EPISODES_TO_TRAIN = 4
-ENTROPY_BETA = 0.01
+# ── CLI args ──────────────────────────────────────────────────────────────────
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--seed", type=int, default=None,
+                     help="Seed value (any non-negative integer).")
+_parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4],
+                     help="List of seeds to cycle through (default: 0 1 2 3 4).")
+_args, _ = _parser.parse_known_args()
+
+# ── Experiment config ─────────────────────────────────────────────────────────
+SEEDS              = _args.seeds
+MAX_STEPS          = 1_500_000
+ALGO               = "REINFORCE"
 SOLVED_MEAN_REWARD = 475
-RENDER = False
 
-# ── Palette ──────────────────────────────────────────────────────────────────
+# ── Hyper-parameters ──────────────────────────────────────────────────────────
+GAMMA             = 0.99
+LEARNING_RATE     = 0.001
+EPISODES_TO_TRAIN = 4
+ENTROPY_BETA      = 0.01
+RENDER            = False
+
+# ── Palette ───────────────────────────────────────────────────────────────────
 BG      = (247, 250, 252)
 CART_C  = ( 27,  43,  91)
 POLE_C  = (255, 127,  80)
@@ -66,6 +85,13 @@ def calc_qvals(rewards: tt.List[float]) -> tt.List[float]:
     mean_q = np.mean(res)
     std_q = np.std(res) + 1e-8
     return [(q - mean_q) / std_q for q in res]
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 def draw(screen, obs, step, episode, reward, mean_100, fonts):
@@ -123,19 +149,17 @@ def draw(screen, obs, step, episode, reward, mean_100, fonts):
     pygame.display.flip()
 
 
-if __name__ == "__main__":
-    if RENDER:
-        pygame.init()
-        screen = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("CartPole — Policy Gradient Training")
-        clock = pygame.time.Clock()
-        f_hdr = pygame.font.SysFont("Arial", 11, bold=True)
-        f_lbl = pygame.font.SysFont("Arial", 12)
-        f_dat = pygame.font.SysFont("Arial", 18, bold=True)
-        fonts = (f_hdr, f_lbl, f_dat)
+def run_seed(seed: int) -> dict:
+    set_seed(seed)
 
     env = gym.make("CartPole-v1")
-    writer = SummaryWriter(comment="-cartpole-reinforce-baseline")
+    env.action_space.seed(seed)
+    try:
+        env.reset(seed=seed)
+    except TypeError:
+        env.seed(seed)
+
+    tb_writer = SummaryWriter(comment=f"-cartpole-reinforce-seed{seed}")
 
     net = PGN(env.observation_space.shape[0], env.action_space.n)
     print(net)
@@ -147,21 +171,28 @@ if __name__ == "__main__":
     optimizer = optim.Adam(net.parameters(), lr=LEARNING_RATE)
 
     total_rewards = []
-    step_idx = 0
     done_episodes = 0
     last_reward = 0.0
     mean_rewards = 0.0
+    solved = False
+    history = []
 
     batch_episodes = 0
     batch_states, batch_actions, batch_qvals = [], [], []
-    cur_states, cur_actions, cur_rewards = [], [], []
+    cur_states, cur_actions, cur_rewards     = [], [], []
+
+    t_start = time.time()
 
     for step_idx, exp in enumerate(exp_source):
+        if step_idx >= MAX_STEPS:
+            solved = False
+            break
+
         if RENDER:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     env.close()
-                    writer.close()
+                    tb_writer.close()
                     pygame.quit()
                     sys.exit()
             draw(screen, exp.state, step_idx, done_episodes,
@@ -185,25 +216,31 @@ if __name__ == "__main__":
         new_rewards = exp_source.pop_total_rewards()
         if new_rewards:
             done_episodes += 1
-            last_reward = new_rewards[0]
+            last_reward    = new_rewards[0]
             total_rewards.append(last_reward)
-            mean_rewards = float(np.mean(total_rewards[-100:]))
+            mean_rewards   = float(np.mean(total_rewards[-100:]))
+            history.append({
+                "episode":  done_episodes,
+                "step":     step_idx,
+                "reward":   last_reward,
+                "mean_100": round(mean_rewards, 2),
+            })
             print("%d: reward: %6.2f, mean_100: %6.2f, episodes: %d" % (
                 step_idx, last_reward, mean_rewards, done_episodes))
-            writer.add_scalar("reward", last_reward, step_idx)
-            writer.add_scalar("reward_100", mean_rewards, step_idx)
-            writer.add_scalar("episodes", done_episodes, step_idx)
+            tb_writer.add_scalar("reward",     last_reward,  step_idx)
+            tb_writer.add_scalar("reward_100", mean_rewards, step_idx)
+            tb_writer.add_scalar("episodes",   done_episodes, step_idx)
             if mean_rewards >= SOLVED_MEAN_REWARD:
                 print("Solved in %d steps and %d episodes!" % (step_idx, done_episodes))
-                torch.save(net.state_dict(), "cartpole-pg.pth")
+                solved = True
                 break
 
         if batch_episodes < EPISODES_TO_TRAIN:
             continue
 
-        states_v = torch.as_tensor(np.asarray(batch_states), dtype=torch.float32)
+        states_v        = torch.as_tensor(np.asarray(batch_states), dtype=torch.float32)
         batch_actions_t = torch.as_tensor(batch_actions, dtype=torch.int64)
-        batch_qvals_v = torch.as_tensor(batch_qvals, dtype=torch.float32)
+        batch_qvals_v   = torch.as_tensor(batch_qvals,  dtype=torch.float32)
 
         optimizer.zero_grad()
         logits_v = net(states_v)
@@ -211,10 +248,10 @@ if __name__ == "__main__":
         log_prob_actions_v = batch_qvals_v * log_prob_v[range(len(batch_states)), batch_actions_t]
         loss_policy = -log_prob_actions_v.mean()
 
-        prob_v = F.softmax(logits_v, dim=1)
-        entropy_v = -(prob_v * log_prob_v).sum(dim=1).mean()
+        prob_v      = F.softmax(logits_v, dim=1)
+        entropy_v   = -(prob_v * log_prob_v).sum(dim=1).mean()
         entropy_loss = -ENTROPY_BETA * entropy_v
-        loss_v = loss_policy + entropy_loss
+        loss_v       = loss_policy + entropy_loss
 
         loss_v.backward()
         optimizer.step()
@@ -224,7 +261,74 @@ if __name__ == "__main__":
         batch_actions.clear()
         batch_qvals.clear()
 
-    writer.close()
+    wall_time = round(time.time() - t_start, 1)
+
+    model_dir = os.path.join("models", ALGO)
+    os.makedirs(model_dir, exist_ok=True)
+    torch.save(net.state_dict(), os.path.join(model_dir, f"cartpole-{ALGO.lower()}-seed{seed}.pth"))
+
+    hist_dir = os.path.join("history", ALGO)
+    os.makedirs(hist_dir, exist_ok=True)
+    csv_path = os.path.join(hist_dir, f"history_{ALGO}_seed{seed}.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["episode", "step", "reward", "mean_100"])
+        w.writeheader()
+        w.writerows(history)
+    print(f"History saved → {csv_path}")
+
+    tb_writer.close()
     env.close()
+
+    return {
+        "algo":     ALGO,
+        "seed":     seed,
+        "episodes": done_episodes,
+        "steps":    step_idx,
+        "time_s":   wall_time,
+        "mean100":  round(mean_rewards, 2),
+        "std":      round(float(np.std(total_rewards[-100:])), 2),
+        "solved":   solved,
+    }
+
+
+if __name__ == "__main__":
+    if RENDER:
+        pygame.init()
+        screen = pygame.display.set_mode((W, H))
+        pygame.display.set_caption("CartPole — Policy Gradient Training")
+        clock = pygame.time.Clock()
+        f_hdr = pygame.font.SysFont("Arial", 11, bold=True)
+        f_lbl = pygame.font.SysFont("Arial", 12)
+        f_dat = pygame.font.SysFont("Arial", 18, bold=True)
+        fonts = (f_hdr, f_lbl, f_dat)
+
+    results_file = "results.csv"
+    fieldnames   = ["algo", "seed", "episodes", "steps", "time_s", "mean100", "std", "solved"]
+
+    if _args.seed is not None:
+        next_seed = _args.seed
+    else:
+        done_seeds = set()
+        if os.path.exists(results_file):
+            with open(results_file, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    if row.get("algo", "").strip() == ALGO:
+                        done_seeds.add(int(row["seed"]))
+
+        next_seed = next((s for s in SEEDS if s not in done_seeds), None)
+        if next_seed is None:
+            next_seed = max(done_seeds) + 1 if done_seeds else 0
+
+    print(f"\n{'='*40}\nRunning {ALGO} seed {next_seed}\n{'='*40}")
+    result = run_seed(next_seed)
+
+    file_exists = os.path.exists(results_file)
+    with open(results_file, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            w.writeheader()
+        w.writerow(result)
+    print(f"Result for seed {next_seed} appended to {results_file}")
+
     if RENDER:
         pygame.quit()
